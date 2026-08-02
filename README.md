@@ -31,6 +31,7 @@ go test -race ./...                   # Linux race detection
 (cd test/fault && go test ./...)       # broker restart, TCP delay and disconnect recovery
 ./scripts/test-integration.sh         # Linux + Docker Desktop
 pwsh ./scripts/test-integration.ps1   # Windows + Docker Desktop
+go run ./cmd/rjs-sdk-bench --help     # release comparison workload
 ```
 
 CI runs the full integration suite under the Linux race detector and rejects
