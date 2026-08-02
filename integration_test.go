@@ -165,3 +165,38 @@ func TestIntegrationManagedPriorityQueue(t *testing.T) {
 		}
 	}
 }
+
+func TestIntegrationConsumerCloseKeepsDurableState(t *testing.T) {
+	client := integrationClient(t)
+	queue := provisionTestQueue(t, client, "close", 0, time.Second)
+	publisher, _ := client.Publisher(queue, "revision-1", 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := publisher.Publish(ctx, PublishMessage{ID: "after-close", Data: []byte("payload")}); err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := client.Consumer(ConsumerConfig{Queue: queue, MaxPriority: 0, ProbeTimeout: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := consumer.Next(ctx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Next after Close = %v, want %v", err, ErrClosed)
+	}
+	reopened, err := client.Consumer(ConsumerConfig{Queue: queue, MaxPriority: 0, ProbeTimeout: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := reopened.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.ID != "after-close" {
+		t.Fatalf("message ID = %q", message.ID)
+	}
+	if err := message.Ack(); err != nil {
+		t.Fatal(err)
+	}
+}

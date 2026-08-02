@@ -7,7 +7,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-docker run --rm -d --name "$name" -p 127.0.0.1::4222 nats:2.12.4-alpine -js >/dev/null
+docker run --rm -d --name "$name" -p 127.0.0.1::4222 nats:2.14.1-alpine -js >/dev/null
 port="$(docker port "$name" 4222/tcp | sed 's/.*://')"
 attempt=0
 until nc -z 127.0.0.1 "$port"; do

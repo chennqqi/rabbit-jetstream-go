@@ -29,6 +29,7 @@ type Consumer struct {
 	probeOrder  []int
 	subs        map[int]*nats.Subscription
 	nexting     atomic.Bool
+	closed      atomic.Bool
 	flightMu    sync.Mutex
 	flightCount int
 	flightBytes int64
@@ -77,6 +78,9 @@ func (c *Client) Consumer(config ConsumerConfig) (*Consumer, error) {
 		durable, _ := PriorityConsumerName(config.Queue, priority)
 		sub, err := c.js.PullSubscribe(subject, durable, nats.Bind(stream, durable))
 		if err != nil {
+			for _, opened := range consumer.subs {
+				_ = opened.Unsubscribe()
+			}
 			return nil, fmt.Errorf("bind consumer %s: %w", durable, err)
 		}
 		consumer.subs[priority] = sub
@@ -87,6 +91,9 @@ func (c *Client) Consumer(config ConsumerConfig) (*Consumer, error) {
 // Next returns one message. A Consumer permits one concurrent Next call;
 // parallelism belongs in handlers after delivery.
 func (c *Consumer) Next(ctx context.Context) (*Message, error) {
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
 	if !c.nexting.CompareAndSwap(false, true) {
 		return nil, ErrConcurrentNext
 	}
@@ -130,6 +137,22 @@ func (c *Consumer) Next(ctx context.Context) (*Message, error) {
 			c.scheduler.RecordEmpty()
 		}
 	}
+}
+
+// Close releases local pull subscriptions without deleting durable consumers.
+// It is safe to call more than once. In-flight messages remain subject to their
+// normal AckWait and may be redelivered to another Consumer instance.
+func (c *Consumer) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	var joined error
+	for _, subscription := range c.subs {
+		if err := subscription.Unsubscribe(); err != nil {
+			joined = errors.Join(joined, err)
+		}
+	}
+	return joined
 }
 
 func (c *Consumer) wrap(raw *nats.Msg, priority int) (*Message, error) {

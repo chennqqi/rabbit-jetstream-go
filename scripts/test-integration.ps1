@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 $name = "rabbit-jetstream-go-test-$PID"
 
 try {
-    docker run --rm -d --name $name -p 127.0.0.1::4222 nats:2.12.4-alpine -js | Out-Null
+    docker run --rm -d --name $name -p 127.0.0.1::4222 nats:2.14.1-alpine -js | Out-Null
     $port = docker port $name 4222/tcp
     $port = ($port -split ':')[-1]
     $ready = $false
