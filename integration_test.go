@@ -122,3 +122,46 @@ func TestIntegrationBackpressureAndRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestIntegrationManagedPriorityQueue binds only to resources created by the
+// rabbit-jetstream control plane. It intentionally never calls
+// EnsurePriorityQueue, making it a cross-repository contract test.
+func TestIntegrationManagedPriorityQueue(t *testing.T) {
+	queue := os.Getenv("RJS_MANAGED_QUEUE")
+	revision := os.Getenv("RJS_MANAGED_REVISION")
+	if queue == "" || revision == "" {
+		t.Skip("RJS_MANAGED_QUEUE and RJS_MANAGED_REVISION are required")
+	}
+	client := integrationClient(t)
+	publisher, err := client.Publisher(queue, revision, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := client.Consumer(ConsumerConfig{Queue: queue, MaxPriority: 2, ProbeTimeout: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	prefix := fmt.Sprintf("managed-%d-", time.Now().UnixNano())
+	for _, message := range []PublishMessage{
+		{ID: prefix + "low", Priority: 0, Data: []byte("low")},
+		{ID: prefix + "high", Priority: 2, Data: []byte("high")},
+	} {
+		if _, err := publisher.Publish(ctx, message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, want := range []string{prefix + "high", prefix + "low"} {
+		message, err := consumer.Next(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if message.ID != want {
+			t.Fatalf("managed delivery = %q, want %q", message.ID, want)
+		}
+		if err := message.Ack(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
