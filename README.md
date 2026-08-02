@@ -28,7 +28,7 @@ tests; it validates existing resources rather than rewriting them.
 ```text
 go test ./...                         # fast unit tests
 go test -race ./...                   # Linux race detection
-(cd test/fault && go test ./...)       # embedded broker restart recovery
+(cd test/fault && go test ./...)       # broker restart, TCP delay and disconnect recovery
 ./scripts/test-integration.sh         # Linux + Docker Desktop
 pwsh ./scripts/test-integration.ps1   # Windows + Docker Desktop
 ```
