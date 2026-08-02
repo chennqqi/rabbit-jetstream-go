@@ -1,7 +1,10 @@
 # rabbit-jetstream-go
 
 Native Go SDK for the `rabbit-jetstream` server distribution. It implements
-the published `v1alpha1` contract without modifying NATS or JetStream.
+the published `v1alpha1` contract without modifying NATS or JetStream. The
+first production release targets RabbitMQ priority-queue functionality through
+this SDK; the SDK is not AMQP-based and full RabbitMQ/AMQP wire compatibility
+belongs to the server project's future roadmap.
 
 The SDK publishes each priority to `rjs.q.{queue}.p.{priority}`, waits for a
 JetStream PubAck, and consumes from one durable pull consumer per priority.
