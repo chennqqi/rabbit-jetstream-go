@@ -26,6 +26,7 @@ type Consumer struct {
 	client      *Client
 	config      ConsumerConfig
 	scheduler   *Scheduler
+	probeOrder  []int
 	subs        map[int]*nats.Subscription
 	nexting     atomic.Bool
 	flightMu    sync.Mutex
@@ -103,7 +104,8 @@ func (c *Consumer) Next(ctx context.Context) (*Message, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		order := c.scheduler.Order()
+		c.probeOrder = c.scheduler.OrderInto(c.probeOrder)
+		order := c.probeOrder
 		found := false
 		for _, priority := range order {
 			probeCtx, cancel := context.WithTimeout(ctx, c.config.ProbeTimeout)

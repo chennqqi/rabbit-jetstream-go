@@ -52,14 +52,20 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 
 // Order returns the priority levels to probe for the next delivery.
 func (s *Scheduler) Order() []int {
+	return s.OrderInto(nil)
+}
+
+// OrderInto appends the next probe order to dst. Reuse dst on hot paths to
+// avoid one allocation per delivery.
+func (s *Scheduler) OrderInto(dst []int) []int {
 	start := s.config.MaxPriority
 	if s.probeRemaining > 0 {
 		start = s.probeCeiling
 	}
 	if start < MinPriority {
-		return nil
+		return dst[:0]
 	}
-	order := make([]int, 0, start-MinPriority+1)
+	order := dst[:0]
 	for priority := start; priority >= MinPriority; priority-- {
 		order = append(order, priority)
 	}
