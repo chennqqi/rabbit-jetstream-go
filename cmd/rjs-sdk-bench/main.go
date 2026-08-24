@@ -32,6 +32,8 @@ type report struct {
 	PayloadBytes             int     `json:"payload_bytes"`
 	Publishers               int     `json:"publishers"`
 	Prefetch                 int     `json:"prefetch_per_priority"`
+	ConfiguredDurationSecs   float64 `json:"configured_duration_seconds,omitempty"`
+	TargetMessagesPerSecond  int     `json:"target_messages_per_second,omitempty"`
 	RequestedMessages        int64   `json:"requested_messages"`
 	Published                int64   `json:"published"`
 	Consumed                 int64   `json:"consumed"`
@@ -57,6 +59,8 @@ func run() error {
 	server := flag.String("server", nats.DefaultURL, "NATS URLs")
 	output := flag.String("output", "", "new JSON report")
 	messages := flag.Int64("messages", 10000, "messages to publish")
+	duration := flag.Duration("duration", 0, "fixed-rate run duration; requires --messages 0 and --rate")
+	targetRate := flag.Int("rate", 0, "target messages per second in duration mode")
 	payloadBytes := flag.Int("payload-bytes", 1024, "payload bytes, at least 16")
 	publishers := flag.Int("publishers", 4, "concurrent synchronous publishers")
 	prefetch := flag.Int("prefetch", 0, "messages prefetched per priority; 0 uses the SDK default")
@@ -64,8 +68,12 @@ func run() error {
 	replicas := flag.Int("replicas", 3, "Stream replicas")
 	timeout := flag.Duration("timeout", 10*time.Minute, "completion timeout")
 	flag.Parse()
-	if *output == "" || *messages < 1 || *payloadBytes < 16 || *publishers < 1 || *prefetch < 0 || *maxPriority < 0 || *maxPriority > 255 || (*replicas != 1 && *replicas != 3 && *replicas != 5) || *timeout <= 0 {
+	if *output == "" || *messages < 0 || *duration < 0 || *targetRate < 0 || *targetRate > 1_000_000 || *payloadBytes < 16 || *publishers < 1 || *prefetch < 0 || *maxPriority < 0 || *maxPriority > 255 || (*replicas != 1 && *replicas != 3 && *replicas != 5) || *timeout <= 0 {
 		return errors.New("invalid benchmark arguments")
+	}
+	totalMessages, err := workload(*messages, *duration, *targetRate, *timeout)
+	if err != nil {
+		return err
 	}
 	nc, err := nats.Connect(*server, nats.Timeout(10*time.Second), nats.MaxReconnects(-1))
 	if err != nil {
@@ -103,8 +111,8 @@ func run() error {
 	var consumed, duplicates, corrupt atomic.Int64
 	consumeErr := make(chan error, 1)
 	go func() {
-		seen := make([]bool, *messages)
-		for consumed.Load() < *messages {
+		seen := make([]uint64, (totalMessages+63)/64)
+		for consumed.Load() < totalMessages {
 			message, err := consumer.Next(ctx)
 			if err != nil {
 				consumeErr <- err
@@ -114,12 +122,12 @@ func run() error {
 				corrupt.Add(1)
 			} else {
 				id := int64(binary.BigEndian.Uint64(message.Data[:8]))
-				if id < 0 || id >= *messages {
+				if id < 0 || id >= totalMessages {
 					corrupt.Add(1)
-				} else if seen[id] {
+				} else if seen[id/64]&(uint64(1)<<uint(id%64)) != 0 {
 					duplicates.Add(1)
 				} else {
-					seen[id] = true
+					seen[id/64] |= uint64(1) << uint(id%64)
 				}
 			}
 			if err := message.Ack(); err != nil {
@@ -134,7 +142,9 @@ func run() error {
 	jobs := make(chan int64, *publishers*2)
 	var published atomic.Int64
 	var latencyMu sync.Mutex
-	latencies := make([]time.Duration, 0, *messages)
+	const maxLatencySamples = int64(1_000_000)
+	sampleEvery := (totalMessages + maxLatencySamples - 1) / maxLatencySamples
+	latencies := make([]time.Duration, 0, minInt64(totalMessages, maxLatencySamples))
 	publishErr := make(chan error, 1)
 	var workers sync.WaitGroup
 	for range *publishers {
@@ -153,15 +163,33 @@ func run() error {
 					}
 					return
 				}
-				latencyMu.Lock()
-				latencies = append(latencies, time.Since(begin))
-				latencyMu.Unlock()
+				if id%sampleEvery == 0 {
+					latencyMu.Lock()
+					latencies = append(latencies, time.Since(begin))
+					latencyMu.Unlock()
+				}
 				published.Add(1)
 			}
 		}()
 	}
-	for id := int64(0); id < *messages; id++ {
-		jobs <- id
+	var pace *time.Ticker
+	if *targetRate > 0 {
+		pace = time.NewTicker(time.Second / time.Duration(*targetRate))
+		defer pace.Stop()
+	}
+	for id := int64(0); id < totalMessages; id++ {
+		if pace != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-pace.C:
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case jobs <- id:
+		}
 	}
 	close(jobs)
 	workers.Wait()
@@ -175,8 +203,8 @@ func run() error {
 		return err
 	}
 	finished := time.Now()
-	missing := *messages - consumed.Load() + duplicates.Load()
-	if published.Load() != *messages || missing != 0 || duplicates.Load() != 0 || corrupt.Load() != 0 {
+	missing := totalMessages - consumed.Load() + duplicates.Load()
+	if published.Load() != totalMessages || missing != 0 || duplicates.Load() != 0 || corrupt.Load() != 0 {
 		return fmt.Errorf("integrity failed: published=%d consumed=%d missing=%d duplicates=%d corrupt=%d", published.Load(), consumed.Load(), missing, duplicates.Load(), corrupt.Load())
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
@@ -187,9 +215,9 @@ func run() error {
 	value := report{
 		Schema: "rabbit-jetstream.io/client-performance-report/v1alpha1", ClientMode: "rabbit-jetstream-go", NATSVersion: nc.ConnectedServerVersion(),
 		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, CPUs: runtime.NumCPU(), Replicas: *replicas, PriorityLevels: *maxPriority + 1,
-		PayloadBytes: *payloadBytes, Publishers: *publishers, Prefetch: consumerConfig.Prefetch, RequestedMessages: *messages, Published: published.Load(), Consumed: consumed.Load(),
+		PayloadBytes: *payloadBytes, Publishers: *publishers, Prefetch: consumerConfig.Prefetch, ConfiguredDurationSecs: duration.Seconds(), TargetMessagesPerSecond: *targetRate, RequestedMessages: totalMessages, Published: published.Load(), Consumed: consumed.Load(),
 		Missing: missing, Duplicates: duplicates.Load(), Corrupt: corrupt.Load(), DurationSeconds: finished.Sub(started).Seconds(),
-		PublishMessagesPerSecond: float64(*messages) / publishFinished.Sub(started).Seconds(), ConsumeMessagesPerSecond: float64(*messages) / finished.Sub(consumeStarted).Seconds(),
+		PublishMessagesPerSecond: float64(totalMessages) / publishFinished.Sub(started).Seconds(), ConsumeMessagesPerSecond: float64(totalMessages) / finished.Sub(consumeStarted).Seconds(),
 		PublishLatencyP50Millis: percentile(.50), PublishLatencyP95Millis: percentile(.95), PublishLatencyP99Millis: percentile(.99),
 	}
 	file, err := os.OpenFile(*output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -202,4 +230,28 @@ func run() error {
 		return encodeErr
 	}
 	return closeErr
+}
+
+func minInt64(left, right int64) int {
+	if left < right {
+		return int(left)
+	}
+	return int(right)
+}
+
+func workload(messages int64, duration time.Duration, targetRate int, timeout time.Duration) (int64, error) {
+	if duration > 0 {
+		if messages != 0 || targetRate <= 0 || timeout <= duration {
+			return 0, errors.New("duration mode requires --messages 0, positive --rate, and timeout greater than duration")
+		}
+		total := int64(duration.Seconds() * float64(targetRate))
+		if total < 1 {
+			return 0, errors.New("benchmark must request at least one message")
+		}
+		return total, nil
+	}
+	if messages < 1 || targetRate != 0 {
+		return 0, errors.New("message mode requires positive --messages and no --rate")
+	}
+	return messages, nil
 }
