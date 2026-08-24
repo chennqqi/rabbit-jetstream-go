@@ -172,17 +172,23 @@ func run() error {
 			}
 		}()
 	}
-	var pace *time.Ticker
-	if *targetRate > 0 {
-		pace = time.NewTicker(time.Second / time.Duration(*targetRate))
-		defer pace.Stop()
+	paceStarted := time.Now()
+	paceBatch := int64(1)
+	if *targetRate >= 100 {
+		paceBatch = int64(*targetRate / 100)
 	}
 	for id := int64(0); id < totalMessages; id++ {
-		if pace != nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-pace.C:
+		if *targetRate > 0 && id > 0 && id%paceBatch == 0 {
+			deadline := paceStarted.Add(time.Duration(id * int64(time.Second) / int64(*targetRate)))
+			wait := time.Until(deadline)
+			if wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
 			}
 		}
 		select {
