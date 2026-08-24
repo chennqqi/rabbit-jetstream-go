@@ -5,11 +5,13 @@ import (
 	"sync"
 
 	"github.com/nats-io/nats.go"
+	jsapi "github.com/nats-io/nats.go/jetstream"
 )
 
 type Client struct {
 	nc      *nats.Conn
 	js      nats.JetStreamContext
+	jsapi   jsapi.JetStream
 	owned   bool
 	closeMu sync.Mutex
 	closed  bool
@@ -40,7 +42,11 @@ func New(nc *nats.Conn, options ...nats.JSOpt) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open JetStream context: %w", err)
 	}
-	return &Client{nc: nc, js: js}, nil
+	modern, err := jsapi.New(nc)
+	if err != nil {
+		return nil, fmt.Errorf("open modern JetStream context: %w", err)
+	}
+	return &Client{nc: nc, js: js, jsapi: modern}, nil
 }
 
 func (c *Client) Close() error {

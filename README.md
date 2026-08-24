@@ -8,8 +8,11 @@ belongs to the server project's future roadmap.
 
 The SDK publishes each priority to `rjs.q.{queue}.p.{priority}`, waits for a
 JetStream PubAck, and consumes from one durable pull consumer per priority.
-Its bounded strict-priority scheduler prevents permanent starvation: after a
-configured high-priority burst it probes lower levels before resuming.
+Each durable priority consumer is continuously prefetched into a bounded local
+buffer. `Next` scans those buffers from high to low without a network round trip
+per empty priority. Its bounded strict-priority scheduler prevents permanent
+starvation: after a configured high-priority burst it probes lower levels before
+resuming.
 
 ```go
 client, err := rabbitjetstream.Connect(nats.DefaultURL)
@@ -43,3 +46,12 @@ coverage below 70%. New reliability behavior should raise that baseline.
 Delivery is at least once. Ack only after application work is durable, retain
 stable message IDs for deduplication, and size in-flight limits for the process
 memory budget.
+
+`ConsumerConfig.Prefetch` is the per-priority local buffer size. Zero divides a
+256-message default budget across the configured priority levels (for example,
+32 messages per level for eight levels). Prefetched lower-priority messages may
+already be assigned to this SDK process when a new higher-priority message
+arrives, matching the practical prefetch boundary of RabbitMQ priority queues.
+Call `Consumer.Close` during graceful shutdown so buffered messages are NAKed
+for prompt redelivery. Increase prefetch only after measuring process memory and
+priority latency with the production payload distribution.

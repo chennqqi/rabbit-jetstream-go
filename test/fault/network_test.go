@@ -137,6 +137,17 @@ func TestNetworkDelayAndDisconnectRecovery(t *testing.T) {
 	if time.Since(started) < 15*time.Millisecond {
 		t.Fatal("network delay was not applied to PubAck path")
 	}
+	consumer, err := client.Consumer(rabbitjetstream.ConsumerConfig{Queue: queue, MaxPriority: 1, ProbeTimeout: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := consumer.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := message.Ack(); err != nil {
+		t.Fatal(err)
+	}
 
 	proxy.interrupt()
 	select {
@@ -147,17 +158,14 @@ func TestNetworkDelayAndDisconnectRecovery(t *testing.T) {
 	if _, err := publisher.Publish(ctx, rabbitjetstream.PublishMessage{ID: "recovered", Data: []byte("recovered")}); err != nil {
 		t.Fatal(err)
 	}
-	consumer, err := client.Consumer(rabbitjetstream.ConsumerConfig{Queue: queue, MaxPriority: 1, ProbeTimeout: 20 * time.Millisecond})
+	message, err = consumer.Next(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range 2 {
-		message, err := consumer.Next(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := message.Ack(); err != nil {
-			t.Fatal(err)
-		}
+	if message.ID != "recovered" {
+		t.Fatalf("message after reconnect = %q, want recovered", message.ID)
+	}
+	if err := message.Ack(); err != nil {
+		t.Fatal(err)
 	}
 }

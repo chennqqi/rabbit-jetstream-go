@@ -31,6 +31,7 @@ type report struct {
 	PriorityLevels           int     `json:"priority_levels"`
 	PayloadBytes             int     `json:"payload_bytes"`
 	Publishers               int     `json:"publishers"`
+	Prefetch                 int     `json:"prefetch_per_priority"`
 	RequestedMessages        int64   `json:"requested_messages"`
 	Published                int64   `json:"published"`
 	Consumed                 int64   `json:"consumed"`
@@ -58,11 +59,12 @@ func run() error {
 	messages := flag.Int64("messages", 10000, "messages to publish")
 	payloadBytes := flag.Int("payload-bytes", 1024, "payload bytes, at least 16")
 	publishers := flag.Int("publishers", 4, "concurrent synchronous publishers")
+	prefetch := flag.Int("prefetch", 0, "messages prefetched per priority; 0 uses the SDK default")
 	maxPriority := flag.Int("max-priority", 2, "maximum priority")
 	replicas := flag.Int("replicas", 3, "Stream replicas")
 	timeout := flag.Duration("timeout", 10*time.Minute, "completion timeout")
 	flag.Parse()
-	if *output == "" || *messages < 1 || *payloadBytes < 16 || *publishers < 1 || *maxPriority < 0 || *maxPriority > 255 || (*replicas != 1 && *replicas != 3 && *replicas != 5) || *timeout <= 0 {
+	if *output == "" || *messages < 1 || *payloadBytes < 16 || *publishers < 1 || *prefetch < 0 || *maxPriority < 0 || *maxPriority > 255 || (*replicas != 1 && *replicas != 3 && *replicas != 5) || *timeout <= 0 {
 		return errors.New("invalid benchmark arguments")
 	}
 	nc, err := nats.Connect(*server, nats.Timeout(10*time.Second), nats.MaxReconnects(-1))
@@ -84,7 +86,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	consumer, err := client.Consumer(rabbitjetstream.ConsumerConfig{Queue: queue, MaxPriority: *maxPriority, ProbeTimeout: time.Millisecond, MaxInFlightMessages: 1, MaxInFlightBytes: int64(*payloadBytes) * 2})
+	consumerConfig := rabbitjetstream.ConsumerConfig{Queue: queue, MaxPriority: *maxPriority, ProbeTimeout: time.Millisecond, Prefetch: *prefetch, MaxInFlightMessages: 1, MaxInFlightBytes: int64(*payloadBytes) * 2}
+	if consumerConfig.Prefetch == 0 {
+		consumerConfig.Prefetch = rabbitjetstream.DefaultPrefetchMessages / (*maxPriority + 1)
+		if consumerConfig.Prefetch < 1 {
+			consumerConfig.Prefetch = 1
+		}
+	}
+	consumer, err := client.Consumer(consumerConfig)
 	if err != nil {
 		return err
 	}
@@ -178,7 +187,7 @@ func run() error {
 	value := report{
 		Schema: "rabbit-jetstream.io/client-performance-report/v1alpha1", ClientMode: "rabbit-jetstream-go", NATSVersion: nc.ConnectedServerVersion(),
 		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, CPUs: runtime.NumCPU(), Replicas: *replicas, PriorityLevels: *maxPriority + 1,
-		PayloadBytes: *payloadBytes, Publishers: *publishers, RequestedMessages: *messages, Published: published.Load(), Consumed: consumed.Load(),
+		PayloadBytes: *payloadBytes, Publishers: *publishers, Prefetch: consumerConfig.Prefetch, RequestedMessages: *messages, Published: published.Load(), Consumed: consumed.Load(),
 		Missing: missing, Duplicates: duplicates.Load(), Corrupt: corrupt.Load(), DurationSeconds: finished.Sub(started).Seconds(),
 		PublishMessagesPerSecond: float64(*messages) / publishFinished.Sub(started).Seconds(), ConsumeMessagesPerSecond: float64(*messages) / finished.Sub(consumeStarted).Seconds(),
 		PublishLatencyP50Millis: percentile(.50), PublishLatencyP95Millis: percentile(.95), PublishLatencyP99Millis: percentile(.99),

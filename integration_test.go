@@ -85,6 +85,96 @@ func TestIntegrationPriorityFairnessAndPubAck(t *testing.T) {
 	}
 }
 
+func TestIntegrationEightPriorityPrefetchOrder(t *testing.T) {
+	client := integrationClient(t)
+	queue := provisionTestQueue(t, client, "eight_priority", 7, time.Second)
+	publisher, err := client.Publisher(queue, "revision-1", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for priority := 0; priority <= 7; priority++ {
+		for sequence := 0; sequence < 4; sequence++ {
+			id := fmt.Sprintf("p%d-%d", priority, sequence)
+			if _, err := publisher.Publish(ctx, PublishMessage{ID: id, Priority: priority, Data: []byte(id)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	consumer, err := client.Consumer(ConsumerConfig{
+		Queue: queue, MaxPriority: 7, HighPriorityBurst: 32, LowPriorityProbe: 1,
+		ProbeTimeout: time.Millisecond, Prefetch: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for priority := 7; priority >= 0; priority-- {
+		for sequence := 0; sequence < 4; sequence++ {
+			message, err := consumer.Next(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := fmt.Sprintf("p%d-%d", priority, sequence)
+			if message.ID != want {
+				t.Fatalf("delivery at priority %d sequence %d = %q, want %q", priority, sequence, message.ID, want)
+			}
+			if err := message.Ack(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestIntegrationCloseReleasesPrefetchedMessages(t *testing.T) {
+	client := integrationClient(t)
+	queue := provisionTestQueue(t, client, "prefetch_close", 0, 10*time.Second)
+	publisher, _ := client.Publisher(queue, "revision-1", 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for sequence := 0; sequence < 4; sequence++ {
+		id := fmt.Sprintf("buffered-%d", sequence)
+		if _, err := publisher.Publish(ctx, PublishMessage{ID: id, Data: []byte(id)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	consumer, err := client.Consumer(ConsumerConfig{Queue: queue, MaxPriority: 0, Prefetch: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := consumer.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Ack(); err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := client.Consumer(ConsumerConfig{Queue: queue, MaxPriority: 0, Prefetch: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	redelivered := make(map[string]bool, 3)
+	for sequence := 1; sequence < 4; sequence++ {
+		message, err := reopened.Next(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		redelivered[message.ID] = true
+		if err := message.Ack(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for sequence := 1; sequence < 4; sequence++ {
+		want := fmt.Sprintf("buffered-%d", sequence)
+		if !redelivered[want] {
+			t.Errorf("buffered message %q was not redelivered", want)
+		}
+	}
+}
+
 func TestIntegrationBackpressureAndRedelivery(t *testing.T) {
 	client := integrationClient(t)
 	queue := provisionTestQueue(t, client, "redelivery", 0, 150*time.Millisecond)

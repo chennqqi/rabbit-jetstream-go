@@ -10,7 +10,10 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	jsapi "github.com/nats-io/nats.go/jetstream"
 )
+
+const DefaultPrefetchMessages = 256
 
 type ConsumerConfig struct {
 	Queue               string
@@ -18,6 +21,7 @@ type ConsumerConfig struct {
 	HighPriorityBurst   int
 	LowPriorityProbe    int
 	ProbeTimeout        time.Duration
+	Prefetch            int
 	MaxInFlightMessages int
 	MaxInFlightBytes    int64
 }
@@ -27,9 +31,15 @@ type Consumer struct {
 	config      ConsumerConfig
 	scheduler   *Scheduler
 	probeOrder  []int
-	subs        map[int]*nats.Subscription
+	subs        map[int]jsapi.Consumer
+	buffered    map[int]chan jsapi.Msg
+	consumeCtxs []jsapi.ConsumeContext
+	notify      chan struct{}
+	consumeErr  chan error
+	done        chan struct{}
 	nexting     atomic.Bool
 	closed      atomic.Bool
+	primed      bool
 	flightMu    sync.Mutex
 	flightCount int
 	flightBytes int64
@@ -42,7 +52,7 @@ type Message struct {
 	Data     []byte
 	Header   nats.Header
 
-	raw      *nats.Msg
+	raw      jsapi.Msg
 	owner    *Consumer
 	settleMu sync.Mutex
 	settled  bool
@@ -64,6 +74,15 @@ func (c *Client) Consumer(config ConsumerConfig) (*Consumer, error) {
 	if config.MaxInFlightBytes <= 0 {
 		config.MaxInFlightBytes = 64 << 20
 	}
+	if config.Prefetch <= 0 {
+		config.Prefetch = DefaultPrefetchMessages / (config.MaxPriority + 1)
+		if config.Prefetch < 1 {
+			config.Prefetch = 1
+		}
+	}
+	if config.Prefetch > 4096 {
+		return nil, fmt.Errorf("prefetch %d exceeds maximum 4096", config.Prefetch)
+	}
 	scheduler, err := NewScheduler(SchedulerConfig{
 		MaxPriority: config.MaxPriority, HighPriorityBurst: config.HighPriorityBurst,
 		LowPriorityProbe: config.LowPriorityProbe,
@@ -72,18 +91,54 @@ func (c *Client) Consumer(config ConsumerConfig) (*Consumer, error) {
 		return nil, err
 	}
 	stream, _ := StreamName(config.Queue)
-	consumer := &Consumer{client: c, config: config, scheduler: scheduler, subs: make(map[int]*nats.Subscription)}
+	consumer := &Consumer{
+		client: c, config: config, scheduler: scheduler,
+		subs: make(map[int]jsapi.Consumer), buffered: make(map[int]chan jsapi.Msg),
+		notify: make(chan struct{}, 1), consumeErr: make(chan error, 1), done: make(chan struct{}),
+	}
+	bindCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	for priority := MinPriority; priority <= config.MaxPriority; priority++ {
-		subject, _ := PrioritySubject(config.Queue, priority)
 		durable, _ := PriorityConsumerName(config.Queue, priority)
-		sub, err := c.js.PullSubscribe(subject, durable, nats.Bind(stream, durable))
+		sub, err := c.jsapi.Consumer(bindCtx, stream, durable)
 		if err != nil {
-			for _, opened := range consumer.subs {
-				_ = opened.Unsubscribe()
-			}
 			return nil, fmt.Errorf("bind consumer %s: %w", durable, err)
 		}
 		consumer.subs[priority] = sub
+		consumer.buffered[priority] = make(chan jsapi.Msg, config.Prefetch)
+	}
+	for priority := MinPriority; priority <= config.MaxPriority; priority++ {
+		durable, _ := PriorityConsumerName(config.Queue, priority)
+		sub := consumer.subs[priority]
+		priority := priority
+		consumeCtx, err := sub.Consume(func(message jsapi.Msg) {
+			select {
+			case consumer.buffered[priority] <- message:
+				select {
+				case consumer.notify <- struct{}{}:
+				default:
+				}
+			case <-consumer.done:
+				_ = message.Nak()
+			}
+		}, jsapi.PullMaxMessages(config.Prefetch), jsapi.ConsumeErrHandler(func(_ jsapi.ConsumeContext, err error) {
+			select {
+			case consumer.consumeErr <- fmt.Errorf("consume priority %d: %w", priority, err):
+			default:
+			}
+			select {
+			case consumer.notify <- struct{}{}:
+			default:
+			}
+		}))
+		if err != nil {
+			close(consumer.done)
+			for _, opened := range consumer.consumeCtxs {
+				opened.Stop()
+			}
+			return nil, fmt.Errorf("start consumer %s: %w", durable, err)
+		}
+		consumer.consumeCtxs = append(consumer.consumeCtxs, consumeCtx)
 	}
 	return consumer, nil
 }
@@ -101,6 +156,23 @@ func (c *Consumer) Next(ctx context.Context) (*Message, error) {
 	if err := c.client.checkOpen(); err != nil {
 		return nil, err
 	}
+	if !c.primed {
+		primeWait := c.config.ProbeTimeout
+		if primeWait < 10*time.Millisecond {
+			primeWait = 10 * time.Millisecond
+		}
+		timer := time.NewTimer(primeWait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case err := <-c.consumeErr:
+			timer.Stop()
+			return nil, err
+		case <-timer.C:
+			c.primed = true
+		}
+	}
 	c.flightMu.Lock()
 	full := c.flightCount >= c.config.MaxInFlightMessages
 	c.flightMu.Unlock()
@@ -113,30 +185,44 @@ func (c *Consumer) Next(ctx context.Context) (*Message, error) {
 		}
 		c.probeOrder = c.scheduler.OrderInto(c.probeOrder)
 		order := c.probeOrder
-		found := false
 		for _, priority := range order {
-			probeCtx, cancel := context.WithTimeout(ctx, c.config.ProbeTimeout)
-			messages, err := c.subs[priority].Fetch(1, nats.Context(probeCtx))
-			cancel()
-			if err != nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("fetch priority %d: %w", priority, err)
+			select {
+			case message := <-c.buffered[priority]:
+				return c.deliver(message, priority)
+			default:
 			}
-			if len(messages) == 0 {
-				continue
-			}
-			found = true
-			message, err := c.wrap(messages[0], priority)
-			if err != nil {
-				_ = messages[0].Nak()
-				return nil, err
-			}
-			c.scheduler.Record(priority)
-			return message, nil
 		}
-		if !found {
-			c.scheduler.RecordEmpty()
+		c.scheduler.RecordEmpty()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case err := <-c.consumeErr:
+			return nil, err
+		case <-c.notify:
+			// A short aggregation window lets concurrently active priority
+			// consumers fill their buffers before the next ordered scan.
+			timer := time.NewTimer(c.config.ProbeTimeout)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case err := <-c.consumeErr:
+				timer.Stop()
+				return nil, err
+			case <-timer.C:
+			}
 		}
 	}
+}
+
+func (c *Consumer) deliver(raw jsapi.Msg, priority int) (*Message, error) {
+	message, err := c.wrap(raw, priority)
+	if err != nil {
+		_ = raw.Nak()
+		return nil, err
+	}
+	c.scheduler.Record(priority)
+	return message, nil
 }
 
 // Close releases local pull subscriptions without deleting durable consumers.
@@ -146,24 +232,39 @@ func (c *Consumer) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	close(c.done)
+	for _, consumeCtx := range c.consumeCtxs {
+		consumeCtx.Stop()
+	}
 	var joined error
-	for _, subscription := range c.subs {
-		if err := subscription.Unsubscribe(); err != nil {
-			joined = errors.Join(joined, err)
+	for priority, messages := range c.buffered {
+		for {
+			select {
+			case message := <-messages:
+				if err := message.Nak(); err != nil {
+					joined = errors.Join(joined, fmt.Errorf("release buffered priority %d: %w", priority, err))
+				}
+			default:
+				goto drained
+			}
 		}
+	drained:
+		delete(c.buffered, priority)
 	}
 	return joined
 }
 
-func (c *Consumer) wrap(raw *nats.Msg, priority int) (*Message, error) {
-	parsed, err := strconv.Atoi(raw.Header.Get(HeaderPriority))
+func (c *Consumer) wrap(raw jsapi.Msg, priority int) (*Message, error) {
+	header := raw.Headers()
+	parsed, err := strconv.Atoi(header.Get(HeaderPriority))
 	if err != nil || parsed != priority {
-		return nil, fmt.Errorf("invalid %s header %q for priority %d", HeaderPriority, raw.Header.Get(HeaderPriority), priority)
+		return nil, fmt.Errorf("invalid %s header %q for priority %d", HeaderPriority, header.Get(HeaderPriority), priority)
 	}
-	if raw.Header.Get(HeaderContractVersion) != ContractVersion || raw.Header.Get(HeaderQueue) != c.config.Queue || raw.Header.Get(HeaderMessageID) == "" {
+	if header.Get(HeaderContractVersion) != ContractVersion || header.Get(HeaderQueue) != c.config.Queue || header.Get(HeaderMessageID) == "" {
 		return nil, fmt.Errorf("message does not satisfy %s contract", ContractVersion)
 	}
-	size := int64(len(raw.Data))
+	data := raw.Data()
+	size := int64(len(data))
 	c.flightMu.Lock()
 	defer c.flightMu.Unlock()
 	if c.flightBytes+size > c.config.MaxInFlightBytes && c.flightCount > 0 {
@@ -171,7 +272,7 @@ func (c *Consumer) wrap(raw *nats.Msg, priority int) (*Message, error) {
 	}
 	c.flightCount++
 	c.flightBytes += size
-	return &Message{ID: raw.Header.Get(HeaderMessageID), Queue: c.config.Queue, Priority: priority, Data: raw.Data, Header: cloneHeader(raw.Header), raw: raw, owner: c}, nil
+	return &Message{ID: header.Get(HeaderMessageID), Queue: c.config.Queue, Priority: priority, Data: data, Header: cloneHeader(header), raw: raw, owner: c}, nil
 }
 
 func (m *Message) Ack() error        { return m.settle(func() error { return m.raw.Ack() }) }
