@@ -122,6 +122,12 @@ func (c *Client) Consumer(config ConsumerConfig) (*Consumer, error) {
 				_ = message.Nak()
 			}
 		}, jsapi.PullMaxMessages(config.Prefetch), jsapi.ConsumeErrHandler(func(_ jsapi.ConsumeContext, err error) {
+			// Consume reports both terminal and recoverable errors. Connection
+			// loss, server shutdown and missing heartbeats are handled by the
+			// nats.go pull loop and must not make Next fail after recovery.
+			if !isTerminalConsumeError(err) {
+				return
+			}
 			select {
 			case consumer.consumeErr <- fmt.Errorf("consume priority %d: %w", priority, err):
 			default:
@@ -141,6 +147,10 @@ func (c *Client) Consumer(config ConsumerConfig) (*Consumer, error) {
 		consumer.consumeCtxs = append(consumer.consumeCtxs, consumeCtx)
 	}
 	return consumer, nil
+}
+
+func isTerminalConsumeError(err error) bool {
+	return errors.Is(err, jsapi.ErrConsumerDeleted) || errors.Is(err, jsapi.ErrBadRequest)
 }
 
 // Next returns one message. A Consumer permits one concurrent Next call;
