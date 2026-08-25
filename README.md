@@ -6,6 +6,11 @@ first production release targets RabbitMQ priority-queue functionality through
 this SDK; the SDK is not AMQP-based and full RabbitMQ/AMQP wire compatibility
 belongs to the server project's future roadmap.
 
+The v0.1 production-qualified profile supports up to eight priority levels
+(`MaxPriority <= 7`) on Linux/AMD64 with a three-node, three-replica
+JetStream cluster. Larger values remain experimental until separately
+qualified.
+
 The SDK publishes each priority to `rjs.q.{queue}.p.{priority}`, waits for a
 JetStream PubAck, and consumes from one durable pull consumer per priority.
 Each durable priority consumer is continuously prefetched into a bounded local
