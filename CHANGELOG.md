@@ -1,5 +1,7 @@
 # Changelog
 
+[English](CHANGELOG.md) | [简体中文](CHANGELOG.zh-CN.md)
+
 ## v0.1.0-rc.1
 
 - Publish priority messages with stable IDs and synchronous JetStream PubAck.

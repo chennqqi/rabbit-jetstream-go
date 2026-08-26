@@ -1,5 +1,7 @@
 # rabbit-jetstream-go
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Native Go SDK for the `rabbit-jetstream` server distribution. It implements
 the published `v1alpha1` contract without modifying NATS or JetStream. The
 first production release targets RabbitMQ priority-queue functionality through
