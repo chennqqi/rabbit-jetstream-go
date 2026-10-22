@@ -2,7 +2,7 @@
 
 [English](CHANGELOG.md) | [简体中文](CHANGELOG.zh-CN.md)
 
-## 未发布
+## v0.1.0-rc.4
 
 - 新增 `Message.NakWithDelay`：由 broker 按消息延迟重投，无需延迟拓扑即可实现有界消费退避。
 - 新增 `Message.Deliveries`：暴露 broker 权威投递次数，适配器可实现 `MaxDeliveries` 门控而无需应用层计数。

@@ -2,7 +2,7 @@
 
 [English](CHANGELOG.md) | [简体中文](CHANGELOG.zh-CN.md)
 
-## Unreleased
+## v0.1.0-rc.4
 
 - Add `Message.NakWithDelay` for broker-scheduled per-message delayed redelivery, enabling bounded consumer backoff without a delay topology.
 - Add `Message.Deliveries` exposing the broker-authoritative delivery count so adapters can enforce `MaxDeliveries` gates without application-side counters.

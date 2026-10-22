@@ -22,7 +22,7 @@ func cloneHeader(source nats.Header) nats.Header {
 }
 
 const (
-	SDKVersion      = "0.1.0-rc.3"
+	SDKVersion      = "0.1.0-rc.4"
 	ContractVersion = "v1alpha1"
 
 	HeaderMessageID       = "Nats-Msg-Id"
