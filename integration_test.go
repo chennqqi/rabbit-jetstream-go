@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	jsapi "github.com/nats-io/nats.go/jetstream"
 )
 
 func integrationClient(t *testing.T) *Client {
@@ -213,6 +214,91 @@ func TestIntegrationBackpressureAndRedelivery(t *testing.T) {
 	}
 }
 
+// TestIntegrationDelayedSettleAndBacklog covers the settle and backlog
+// primitives adapters need: NakWithDelay delays per-message redelivery,
+// Deliveries exposes the broker delivery count, TermWithReason quarantines
+// permanently, Pending reports broker-side ready depth, and a Publisher built
+// with an empty policy revision works against EnsurePriorityQueue topology.
+func TestIntegrationDelayedSettleAndBacklog(t *testing.T) {
+	client := integrationClient(t)
+	queue := provisionTestQueue(t, client, "delay_nak", 0, 500*time.Millisecond)
+	publisher, err := client.Publisher(queue, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := publisher.Publish(ctx, PublishMessage{ID: "delayed", Data: []byte("payload")}); err != nil {
+		t.Fatal(err)
+	}
+	// Bind without pulling: Pending must report the broker ready depth
+	// deterministically, before any Consumer starts prefetching.
+	stream, _ := StreamName(queue)
+	durable, _ := PriorityConsumerName(queue, 0)
+	sub, err := client.jsapi.Consumer(ctx, stream, durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := &Consumer{client: client, subs: map[int]jsapi.Consumer{0: sub}}
+	pending, err := observer.Pending(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 {
+		t.Fatalf("Pending() before consume = %d, want 1", pending)
+	}
+	consumer, err := client.Consumer(ConsumerConfig{Queue: queue, MaxPriority: 0, ProbeTimeout: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := consumer.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Deliveries(); got != 1 {
+		t.Fatalf("first Deliveries() = %d, want 1", got)
+	}
+	start := time.Now()
+	if err := first.NakWithDelay(300 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	redelivered, err := consumer.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Fatalf("delayed redelivery returned after %v, want >= ~300ms", elapsed)
+	}
+	if redelivered.ID != first.ID {
+		t.Fatalf("redelivered ID = %q, want %q", redelivered.ID, first.ID)
+	}
+	if got := redelivered.Deliveries(); got != 2 {
+		t.Fatalf("second Deliveries() = %d, want 2", got)
+	}
+	if err := redelivered.TermWithReason("poison: rejected by test"); err != nil {
+		t.Fatal(err)
+	}
+	short, stop := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer stop()
+	if _, err := consumer.Next(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Next after TermWithReason = %v, want deadline exceeded", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, err := consumer.Pending(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Pending() = %d after drain, want 0", pending)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // TestIntegrationManagedPriorityQueue binds only to resources created by the
 // rabbit-jetstream control plane. It intentionally never calls
 // EnsurePriorityQueue, making it a cross-repository contract test.
@@ -253,6 +339,49 @@ func TestIntegrationManagedPriorityQueue(t *testing.T) {
 		if err := message.Ack(); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Settle and backlog primitives must behave identically on control-plane
+	// managed topology. The fixture sets maxDeliver=5, leaving room for a
+	// delayed retry.
+	if _, err := publisher.Publish(ctx, PublishMessage{ID: prefix + "retry", Priority: 1, Data: []byte("retry")}); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := consumer.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := retry.Deliveries(); got != 1 {
+		t.Fatalf("managed first Deliveries() = %d, want 1", got)
+	}
+	if err := retry.NakWithDelay(200 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	again, err := consumer.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != retry.ID {
+		t.Fatalf("managed redelivery ID = %q, want %q", again.ID, retry.ID)
+	}
+	if got := again.Deliveries(); got != 2 {
+		t.Fatalf("managed second Deliveries() = %d, want 2", got)
+	}
+	if err := again.TermWithReason("contract test quarantine"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, err := consumer.Pending(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("managed Pending() = %d after drain, want 0", pending)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

@@ -34,7 +34,15 @@ ack, err := publisher.Publish(ctx, rabbitjetstream.PublishMessage{
 
 Production topology should be owned by the `rabbit-jetstream` control plane.
 `EnsurePriorityQueue` is an explicit helper for standalone deployments and
-tests; it validates existing resources rather than rewriting them.
+tests; it validates existing resources rather than rewriting them. Standalone
+topologies have no control-plane revision: pass an empty policy revision to
+`Client.Publisher` to omit the revision header.
+
+On the consume path, `Message.NakWithDelay` schedules per-message delayed
+redelivery for bounded backoff, `Message.Deliveries` exposes the
+broker-authoritative delivery count, `Message.TermWithReason` records an
+auditable quarantine cause, and `Consumer.Pending` reports the broker-side
+ready backlog across all bound priorities.
 
 ## Development
 

@@ -2,6 +2,14 @@
 
 [English](CHANGELOG.md) | [简体中文](CHANGELOG.zh-CN.md)
 
+## 未发布
+
+- 新增 `Message.NakWithDelay`：由 broker 按消息延迟重投，无需延迟拓扑即可实现有界消费退避。
+- 新增 `Message.Deliveries`：暴露 broker 权威投递次数，适配器可实现 `MaxDeliveries` 门控而无需应用层计数。
+- 新增 `Message.TermWithReason`：为终止消息附带可审计原因（要求 NATS server >= 2.10.4）。
+- 新增 `Consumer.Pending`：汇总所有已绑定优先级 consumer 的 broker 侧就绪积压。
+- `Publisher` 的 policy revision 允许为空，用于 standalone 和 `EnsurePriorityQueue` 测试拓扑，此时省略 revision 契约头。
+
 ## v0.1.0-rc.1
 
 - 使用稳定消息 ID 和同步 JetStream PubAck 发布优先级消息。

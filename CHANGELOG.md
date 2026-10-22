@@ -2,6 +2,14 @@
 
 [English](CHANGELOG.md) | [简体中文](CHANGELOG.zh-CN.md)
 
+## Unreleased
+
+- Add `Message.NakWithDelay` for broker-scheduled per-message delayed redelivery, enabling bounded consumer backoff without a delay topology.
+- Add `Message.Deliveries` exposing the broker-authoritative delivery count so adapters can enforce `MaxDeliveries` gates without application-side counters.
+- Add `Message.TermWithReason` attaching an auditable cause to terminated messages (requires NATS server >= 2.10.4).
+- Add `Consumer.Pending` reporting the broker-side ready backlog summed across all bound priority consumers.
+- Allow an empty `Publisher` policy revision for standalone and `EnsurePriorityQueue` test topologies; the revision header is omitted.
+
 ## v0.1.0-rc.1
 
 - Publish priority messages with stable IDs and synchronous JetStream PubAck.

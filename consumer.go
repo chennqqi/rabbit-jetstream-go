@@ -52,10 +52,11 @@ type Message struct {
 	Data     []byte
 	Header   nats.Header
 
-	raw      jsapi.Msg
-	owner    *Consumer
-	settleMu sync.Mutex
-	settled  bool
+	raw        jsapi.Msg
+	owner      *Consumer
+	deliveries uint64
+	settleMu   sync.Mutex
+	settled    bool
 }
 
 func (c *Client) Consumer(config ConsumerConfig) (*Consumer, error) {
@@ -235,6 +236,28 @@ func (c *Consumer) deliver(raw jsapi.Msg, priority int) (*Message, error) {
 	return message, nil
 }
 
+// Pending reports the number of ready, undelivered messages summed across the
+// bound per-priority consumers, as counted by the broker. Messages already
+// delivered but not yet settled are excluded. Schedulers can use it as the
+// broker-side backlog input for overload rejection.
+func (c *Consumer) Pending(ctx context.Context) (int, error) {
+	if c.closed.Load() {
+		return 0, ErrClosed
+	}
+	if err := c.client.checkOpen(); err != nil {
+		return 0, err
+	}
+	var pending int
+	for priority, sub := range c.subs {
+		info, err := sub.Info(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("inspect consumer priority %d: %w", priority, err)
+		}
+		pending += int(info.NumPending)
+	}
+	return pending, nil
+}
+
 // Close releases local pull subscriptions without deleting durable consumers.
 // It is safe to call more than once. In-flight messages remain subject to their
 // normal AckWait and may be redelivered to another Consumer instance.
@@ -273,6 +296,10 @@ func (c *Consumer) wrap(raw jsapi.Msg, priority int) (*Message, error) {
 	if header.Get(HeaderContractVersion) != ContractVersion || header.Get(HeaderQueue) != c.config.Queue || header.Get(HeaderMessageID) == "" {
 		return nil, fmt.Errorf("message does not satisfy %s contract", ContractVersion)
 	}
+	metadata, err := raw.Metadata()
+	if err != nil {
+		return nil, fmt.Errorf("read message metadata: %w", err)
+	}
 	data := raw.Data()
 	size := int64(len(data))
 	c.flightMu.Lock()
@@ -282,13 +309,38 @@ func (c *Consumer) wrap(raw jsapi.Msg, priority int) (*Message, error) {
 	}
 	c.flightCount++
 	c.flightBytes += size
-	return &Message{ID: header.Get(HeaderMessageID), Queue: c.config.Queue, Priority: priority, Data: data, Header: cloneHeader(header), raw: raw, owner: c}, nil
+	return &Message{ID: header.Get(HeaderMessageID), Queue: c.config.Queue, Priority: priority, Data: data, Header: cloneHeader(header), raw: raw, owner: c, deliveries: metadata.NumDelivered}, nil
 }
 
-func (m *Message) Ack() error        { return m.settle(func() error { return m.raw.Ack() }) }
-func (m *Message) Nak() error        { return m.settle(func() error { return m.raw.Nak() }) }
-func (m *Message) Term() error       { return m.settle(func() error { return m.raw.Term() }) }
+func (m *Message) Ack() error { return m.settle(func() error { return m.raw.Ack() }) }
+
+// Nak requests immediate redelivery. For bounded backoff on transient
+// failures use NakWithDelay.
+func (m *Message) Nak() error { return m.settle(func() error { return m.raw.Nak() }) }
+
+// NakWithDelay negatively acknowledges the message and asks the broker to
+// redeliver it after delay. JetStream applies the delay per message, so
+// bounded backoff does not head-of-line block the queue.
+func (m *Message) NakWithDelay(delay time.Duration) error {
+	return m.settle(func() error { return m.raw.NakWithDelay(delay) })
+}
+
+func (m *Message) Term() error { return m.settle(func() error { return m.raw.Term() }) }
+
+// TermWithReason terminates like Term and attaches reason to the JetStream
+// advisory so one-way quarantine carries an auditable cause. It requires
+// NATS server >= 2.10.4; older servers ignore the request.
+func (m *Message) TermWithReason(reason string) error {
+	return m.settle(func() error { return m.raw.TermWithReason(reason) })
+}
+
 func (m *Message) InProgress() error { return m.raw.InProgress() }
+
+// Deliveries returns the broker-authoritative count of how many times this
+// message has been delivered, starting at 1 for the first delivery. It
+// increments on every broker-driven redelivery regardless of how the
+// redelivery was triggered.
+func (m *Message) Deliveries() int { return int(m.deliveries) }
 
 func (m *Message) settle(action func() error) error {
 	m.settleMu.Lock()

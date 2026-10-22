@@ -28,15 +28,16 @@ type PublishAck struct {
 	Duplicate bool
 }
 
+// Publisher creates a publisher bound to one queue. policyRevision is the
+// control-plane queue-plan revision stamped into every message. Pass "" for
+// standalone or test topologies provisioned by EnsurePriorityQueue, where no
+// control-plane revision exists; the revision header is then omitted.
 func (c *Client) Publisher(queue, policyRevision string, maxPriority int) (*Publisher, error) {
 	if err := c.checkOpen(); err != nil {
 		return nil, err
 	}
 	if err := ValidateQueueName(queue); err != nil {
 		return nil, err
-	}
-	if policyRevision == "" {
-		return nil, fmt.Errorf("policy revision is required")
 	}
 	if err := ValidatePriority(maxPriority); err != nil {
 		return nil, fmt.Errorf("max priority: %w", err)
@@ -62,7 +63,9 @@ func (p *Publisher) Publish(ctx context.Context, message PublishMessage) (*Publi
 	header.Set(HeaderMessageID, message.ID)
 	header.Set(HeaderContractVersion, ContractVersion)
 	header.Set(HeaderQueue, p.queue)
-	header.Set(HeaderPolicyRevision, p.policyRevision)
+	if p.policyRevision != "" {
+		header.Set(HeaderPolicyRevision, p.policyRevision)
+	}
 	header.Set(HeaderPriority, strconv.Itoa(message.Priority))
 	ack, err := p.client.js.PublishMsg(&nats.Msg{Subject: subject, Header: header, Data: message.Data}, nats.Context(ctx))
 	if err != nil {

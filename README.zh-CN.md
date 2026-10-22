@@ -17,4 +17,8 @@ pwsh ./scripts/test-integration.ps1
 go run ./cmd/rjs-sdk-bench --help
 ```
 
+生产拓扑应由 `rabbit-jetstream` 控制面管理；`EnsurePriorityQueue` 是 standalone 部署和测试的显式辅助方法，只校验而不重写既有资源。standalone 拓扑没有控制面下发的 revision：向 `Client.Publisher` 传空 policy revision 即可省略 revision 契约头。
+
+消费侧提供 `Message.NakWithDelay`（按消息延迟重投，用于有界退避）、`Message.Deliveries`（broker 权威投递次数）、`Message.TermWithReason`（可审计的隔离原因）和 `Consumer.Pending`（汇总所有绑定优先级的 broker 侧就绪积压）。
+
 交付语义为 at-least-once。业务处理持久化后才能 Ack，并应保留稳定消息 ID 实现幂等。`ConsumerConfig.Prefetch` 是每个优先级的本地缓冲大小；默认总预算为 256。优雅退出时调用 `Consumer.Close`，使缓冲消息通过 NAK 尽快重投。
